@@ -3,6 +3,9 @@
 #include <SparkFun_TB6612.h>
 #include <Wire.h>
 
+#define DEBUG 0
+#define TUNE_KALMAN_FILTER 0
+
 Adafruit_MPU6050 mpu;
 static volatile uint32_t sys_tick = 0;
 static volatile uint32_t r_encoder_counts = 0;
@@ -10,24 +13,23 @@ static volatile uint32_t l_encoder_counts = 0;
 
 static float phi_deg = 0.0f;
 static float phi_dot_dps = 0.0f;
+static const float phi_dot_bias_dps = 2.5f;
 
 // Controller values
 static const float MIN_PHI_FOR_CONTROL = 2.0f;
-static const float KP_ANGLE = 40.0f;
-static const float KD_ANGLE = 0.0f;
+static const float MAX_PHI_FOR_CONTROL = 45.0f;
+static const float KP_ANGLE = 30.0f;
+static const float KD_ANGLE = 0.5f;
 
 // Kalman filter start
-float Q_angle = 0.001;  // Covariance of gyroscope noise
-float Q_gyro = 0.003;   // Covariance of gyroscope drift noise
-float R_angle = 0.5;    // Covariance of accelerometer
-uint8_t C_0 = 1;
-float dt = 0.005; // The filter sampling time
-float K1 = 0.05; 
-float K_0, K_1, t_0, t_1;
-float q_bias; // Gyroscope drift 
-float Pdot[4] = { 0, 0, 0, 0};
-float P[2][2] = {{ 1, 0 }, { 0, 1 }};
-float PCt_0, PCt_1, E;
+static const float dt = 0.005;
+static const float dt_2 = dt * dt;
+static float P[2][2] = { { 1e3, 0 }, { 0 , 1e3 } };          // State estimate covariance matrix
+static const float Q[2][2] = { { 1e-3, 0 }, { 0 , 5e-4 } };  // Covariance of the process noise
+static const float R[2][2] = { { 0.5, 0 }, { 0 , 1e-3 } };   // Covariance of the observation noise
+static float K[2][2] = { { 0, 0 }, { 0, 0 } };
+static float C[2][2] = { { 0, 0 }, { 0, 0 } };
+static float D[2][2] = { { 0, 0 }, { 0, 0 } };
 // Kalman filter end
 
 // Wheel encoders
@@ -60,6 +62,8 @@ uint32_t getRightEncoderCounts(void);
 uint32_t getLeftEncoderCounts(void);
 void clearEncoderCounts(void);
 void initFailedloop(const String failure_msg);
+void mul2x2(const float A[2][2], float B[2][2], float C[2][2]);
+void inv2x2(const float A[2][2], float B[2][2]);
 
 void setup() {
   Serial.begin(115200);
@@ -83,8 +87,8 @@ void setup() {
     initFailedloop("Failed to set MPU6050 gyro range");
   }
 
-  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-  if (MPU6050_BAND_21_HZ != mpu.getFilterBandwidth()) {
+  mpu.setFilterBandwidth(MPU6050_BAND_260_HZ);
+  if (MPU6050_BAND_260_HZ != mpu.getFilterBandwidth()) {
     initFailedloop("Failed to set MPU6050 filter bandwidth");
   }
 
@@ -103,13 +107,13 @@ void setup() {
 
 void loop() {
   static uint32_t task_5ms_trigger_ticks = 2;  // Delay this task by 2ms
-  static uint32_t task_1s_trigger_ticks = 0;
+  static uint32_t task_100ms_trigger_ticks = 0;
 
   const uint32_t cur_sys_tick = getSysTick();
 
-  if (cur_sys_tick > task_1s_trigger_ticks) {
-    task_1s_trigger_ticks += 1000;
-
+  if (cur_sys_tick > task_100ms_trigger_ticks) {
+    task_100ms_trigger_ticks += 100;
+#if DEBUG
     // Print the tilt angle in degrees
     Serial.print("phi = ");
     Serial.println(phi_deg);
@@ -126,6 +130,7 @@ void loop() {
     Serial.println(getLeftEncoderCounts());
 
     Serial.println("");
+#endif
   }
 
   if (cur_sys_tick > task_5ms_trigger_ticks) {
@@ -135,8 +140,8 @@ void loop() {
     calculatePhi();
 
     const int16_t angle_pwm = runAngleController();
-  
-    if (fabsf(phi_deg) > MIN_PHI_FOR_CONTROL) {
+    const float phi_deg_abs = fabsf(phi_deg);
+    if (phi_deg_abs > MIN_PHI_FOR_CONTROL && phi_deg_abs < MAX_PHI_FOR_CONTROL) {
       r_motor.drive(angle_pwm);
       l_motor.drive(angle_pwm);
     }
@@ -185,54 +190,58 @@ void calculatePhi(void)
   // Radial rotation angle calculation formula; 
   // The negative sign indicates the direction.
   // Convert radians to degrees.
-  const float phi_deg_m = -atan2(a.acceleration.y , a.acceleration.z) * (180.0f / PI);
-  const float phi_dot_dps_m = -g.gyro.x * (180.0f / PI);
+  const float phi_deg_m = -atan2f(a.acceleration.y , a.acceleration.z) * (180.0f / PI);
+  const float phi_dot_dps_m = (-g.gyro.x * (180.0f / PI)) - phi_dot_bias_dps;
 
-  // Prior estimate
-  phi_deg += (phi_dot_dps_m - q_bias) * dt;          
-  const float angle_err = phi_deg_m - phi_deg;
- 
-  // Differential of azimuth error covariance
-  Pdot[0] = Q_angle - P[0][1] - P[1][0];    
-  Pdot[1] = - P[1][1];
-  Pdot[2] = - P[1][1];
-  Pdot[3] = Q_gyro;
- 
-  // The integral of the covariance differential of the prior estimate error
-  P[0][0] += Pdot[0] * dt;    
-  P[0][1] += Pdot[1] * dt;
-  P[1][0] += Pdot[2] * dt;
-  P[1][1] += Pdot[3] * dt;
-   
-  // Intermediate variable of matrix multiplication
-  PCt_0 = C_0 * P[0][0];
-  PCt_1 = C_0 * P[1][0];
-   
-  // Denominator
-  E = R_angle + C_0 * PCt_0;
-   
-  // Gain value
-  K_0 = PCt_0 / E;
-  K_1 = PCt_1 / E;
- 
-  // Intermediate variable of matrix multiplication
-  t_0 = PCt_0;  
-  t_1 = C_0 * P[0][1];
- 
-  // Posterior estimation error covariance
-  P[0][0] -= K_0 * t_0;     
-  P[0][1] -= K_0 * t_1;
-  P[1][0] -= K_1 * t_0;
-  P[1][1] -= K_1 * t_1;
- 
-  // Posterior estimation
-  q_bias += K_1 * angle_err;    
- 
-  // The differential value of the output value; work out the optimal angular velocity
-  phi_dot_dps = phi_dot_dps_m - q_bias;   
- 
-  // Posterior estimation; work out the optimal angle
-  phi_deg += K_0 * angle_err; 
+  // Predition step
+  // xk = F * x
+  // F = [1 dt; 0 1]
+  // x = [phi; phi_dot]
+  phi_deg = phi_deg + (dt * phi_dot_dps);
+
+  // P = (F * P * F^T) + Q
+  P[0][0] += (P[1][0] * dt) + (P[0][1] * dt) + (P[1][1] * dt_2) + Q[0][0];
+  P[0][1] += (P[1][1] * dt) + Q[0][1];
+  P[1][0] += (P[1][1] * dt) + Q[1][0];
+  P[1][1] += Q[1][1];
+
+  // Update step
+  // K = P * H^T * ((H * P * H^T) + R)^-1
+  // H = I (both states are measured)
+  // K = P * (P + R)^-1
+  // Let C = (P + R)
+  // Led D = (P + R)^-1
+  C[0][0] = P[0][0] + R[0][0];
+  C[0][1] = P[0][1];
+  C[1][0] = P[1][0];
+  C[1][1] = P[1][1] + R[1][1];
+  inv2x2(C, D);
+  mul2x2(P, D, K);
+
+  // P = (I - (K * H)) * P;
+  // H = I (both states are measured)
+  // P = (I - K) * P
+  // Let C = I - K
+  C[0][0] = 1 - K[0][0];
+  C[0][1] = -K[0][1];
+  C[1][0] = -K[1][0];
+  C[1][1] = 1 - K[1][1];
+
+  D[0][0] = P[0][0];
+  D[0][1] = P[0][1];
+  D[1][0] = P[1][0];
+  D[1][1] = P[1][1];
+
+  mul2x2(C, D, P);
+
+  // x = x + K * ([phi_deg_m; phi_dot_dps_m] - (H * F * x));
+  // Let y = ([phi_deg_m; phi_dot_dps_m] - (H * F * x));
+  float y[2] = { 0, 0 };
+  y[0] = phi_deg_m - (phi_deg + (dt * phi_dot_dps));
+  y[1] = phi_dot_dps_m - phi_dot_dps;
+
+  phi_deg += K[0][0] * y[0] + K[0][1] * y[1];
+  phi_dot_dps += K[1][0] * y[0] + K[1][1] * y[1];
 }
 
 int16_t runAngleController(void)
@@ -279,4 +288,29 @@ void initFailedloop(const String failure_msg) {
   while (1) {
     delay(10);
   }
+}
+
+void mul2x2(const float A[2][2], float B[2][2], float C[2][2])
+{
+  for (uint8_t i = 0; i < 2; i++)
+  {
+    for (uint8_t j = 0; j < 2; j++)
+    {
+      C[i][j] = 0;
+      for (uint8_t k = 0; k < 2; k++)
+      {
+        C[i][j] += A[i][k] * B[k][j];
+      }
+    }
+  }
+}
+
+void inv2x2(const float A[2][2], float B[2][2])
+{
+  const float det = (A[0][0] * A[1][1]) - (A[0][1] * A[1][0]);
+  const float det_inv = 1 / det;
+  B[0][0] = det_inv * A[1][1];
+  B[0][1] = det_inv * -A[0][1];
+  B[1][0] = det_inv * -A[1][0];
+  B[1][1] = det_inv * A[0][0];
 }
