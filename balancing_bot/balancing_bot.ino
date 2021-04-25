@@ -4,33 +4,44 @@
 #include <Wire.h>
 
 #define DEBUG 0
-#define TUNE_KALMAN_FILTER 0
+#define LOG_FILTER_INPUTS 0
+#define COMP_FILTER 1
 
 Adafruit_MPU6050 mpu;
 static volatile uint32_t sys_tick = 0;
 static volatile uint32_t r_encoder_counts = 0;
 static volatile uint32_t l_encoder_counts = 0;
-
-static float phi_deg = 0.0f;
-static float phi_dot_dps = 0.0f;
-static const float phi_dot_bias_dps = 2.5f;
+static bool borked = false;   // Set true once we've toppled over, requries reset to clear
 
 // Controller values
-static const float MIN_PHI_FOR_CONTROL = 2.0f;
-static const float MAX_PHI_FOR_CONTROL = 45.0f;
-static const float KP_ANGLE = 30.0f;
-static const float KD_ANGLE = 0.5f;
-
-// Kalman filter start
 static const float dt = 0.005;
+static const float MAX_PHI_FOR_CONTROL = 45.0f;
+static const float KP_ANGLE = 45.0f;
+static const float KI_ANGLE = 25.0f;
+static const float KD_ANGLE = 0.0f;
+
+#if COMP_FILTER
+static const float alpha = 0.98;
+static const float phi_dot_bias = 2.5f;
+static float phi_deg = 0.0f;
+static float phi_dot_dps = 0.0f;
+#else
+// Kalman filter start
+static float phi_deg = 0.0f;        // State x(0)
+static float phi_dot_bias = 2.5f;   // State x(1)
+static float phi_dot_dps = 0.0f;
+static const float Q_angle = 0.002;
+static const float Q_bias = 0.05;
+static const float R_angle =  0.5;
 static const float dt_2 = dt * dt;
-static float P[2][2] = { { 1e3, 0 }, { 0 , 1e3 } };          // State estimate covariance matrix
-static const float Q[2][2] = { { 1e-3, 0 }, { 0 , 5e-4 } };  // Covariance of the process noise
-static const float R[2][2] = { { 0.5, 0 }, { 0 , 1e-3 } };   // Covariance of the observation noise
-static float K[2][2] = { { 0, 0 }, { 0, 0 } };
-static float C[2][2] = { { 0, 0 }, { 0, 0 } };
-static float D[2][2] = { { 0, 0 }, { 0, 0 } };
+static float P_00 = 1e3;
+static float P_01 = 0.0f;
+static float P_10 = 0.0f;
+static float P_11 = 1e3;;
+static float K_0 = 0.0f;
+static float K_1 = 0.0f;
 // Kalman filter end
+#endif
 
 // Wheel encoders
 static const uint8_t R_ENCODER_PIN = 2;
@@ -62,8 +73,6 @@ uint32_t getRightEncoderCounts(void);
 uint32_t getLeftEncoderCounts(void);
 void clearEncoderCounts(void);
 void initFailedloop(const String failure_msg);
-void mul2x2(const float A[2][2], float B[2][2], float C[2][2]);
-void inv2x2(const float A[2][2], float B[2][2]);
 
 void setup() {
   Serial.begin(115200);
@@ -118,16 +127,9 @@ void loop() {
     Serial.print("phi = ");
     Serial.println(phi_deg);
   
-    // Print the angular velocity in degrees per second
-    Serial.print("phi_dot_dps = ");
+    // Print the tilt angle rate in degrees / second
+    Serial.print("phi_dot = ");
     Serial.println(phi_dot_dps);
-
-    // Print the encoder counts
-    Serial.print("r encoder counts = ");
-    Serial.println(getRightEncoderCounts());
-
-    Serial.print("l encoder counts = ");
-    Serial.println(getLeftEncoderCounts());
 
     Serial.println("");
 #endif
@@ -141,13 +143,16 @@ void loop() {
 
     const int16_t angle_pwm = runAngleController();
     const float phi_deg_abs = fabsf(phi_deg);
-    if (phi_deg_abs > MIN_PHI_FOR_CONTROL && phi_deg_abs < MAX_PHI_FOR_CONTROL) {
+    if (phi_deg_abs < MAX_PHI_FOR_CONTROL && !borked) {
+#if !LOG_FILTER_INPUTS && !DEBUG
       r_motor.drive(angle_pwm);
       l_motor.drive(angle_pwm);
+#endif
     }
     else {
       r_motor.brake();
       l_motor.brake();
+      borked = true;
     }
   }
 }
@@ -191,62 +196,54 @@ void calculatePhi(void)
   // The negative sign indicates the direction.
   // Convert radians to degrees.
   const float phi_deg_m = -atan2f(a.acceleration.y , a.acceleration.z) * (180.0f / PI);
-  const float phi_dot_dps_m = (-g.gyro.x * (180.0f / PI)) - phi_dot_bias_dps;
+  const float phi_dot_dps_m = (-g.gyro.x * (180.0f / PI));
 
-  // Predition step
-  // xk = F * x
-  // F = [1 dt; 0 1]
-  // x = [phi; phi_dot]
-  phi_deg = phi_deg + (dt * phi_dot_dps);
+#if LOG_FILTER_INPUTS
+  Serial.print(getSysTick());
+  Serial.print(", ");
+  Serial.print(phi_deg_m);
+  Serial.print(", ");
+  Serial.print(phi_dot_dps_m);
+  Serial.println("");
+#else
+#if COMP_FILTER
+  phi_dot_dps = phi_dot_dps_m - phi_dot_bias;
+  const float gyro_angle = phi_dot_dps * dt;
+  phi_deg = (alpha * (phi_deg + gyro_angle)) + ((1 - alpha) * phi_deg_m);
+#else
+  phi_deg += dt * (phi_dot_dps_m - phi_dot_bias);
+  P_00 += (-dt * (P_10 + P_01)) + (P_11 * dt_2) + Q_angle;
+  P_01 -= dt * P_11;
+  P_10 -= dt * P_11;
+  P_11 += Q_bias;
 
-  // P = (F * P * F^T) + Q
-  P[0][0] += (P[1][0] * dt) + (P[0][1] * dt) + (P[1][1] * dt_2) + Q[0][0];
-  P[0][1] += (P[1][1] * dt) + Q[0][1];
-  P[1][0] += (P[1][1] * dt) + Q[1][0];
-  P[1][1] += Q[1][1];
+  const float y = phi_deg_m - phi_deg;
+  const float S = P_00 + R_angle;
+  K_0 = P_00 / S;
+  K_1 = P_10 / S;
 
-  // Update step
-  // K = P * H^T * ((H * P * H^T) + R)^-1
-  // H = I (both states are measured)
-  // K = P * (P + R)^-1
-  // Let C = (P + R)
-  // Led D = (P + R)^-1
-  C[0][0] = P[0][0] + R[0][0];
-  C[0][1] = P[0][1];
-  C[1][0] = P[1][0];
-  C[1][1] = P[1][1] + R[1][1];
-  inv2x2(C, D);
-  mul2x2(P, D, K);
-
-  // P = (I - (K * H)) * P;
-  // H = I (both states are measured)
-  // P = (I - K) * P
-  // Let C = I - K
-  C[0][0] = 1 - K[0][0];
-  C[0][1] = -K[0][1];
-  C[1][0] = -K[1][0];
-  C[1][1] = 1 - K[1][1];
-
-  D[0][0] = P[0][0];
-  D[0][1] = P[0][1];
-  D[1][0] = P[1][0];
-  D[1][1] = P[1][1];
-
-  mul2x2(C, D, P);
-
-  // x = x + K * ([phi_deg_m; phi_dot_dps_m] - (H * F * x));
-  // Let y = ([phi_deg_m; phi_dot_dps_m] - (H * F * x));
-  float y[2] = { 0, 0 };
-  y[0] = phi_deg_m - (phi_deg + (dt * phi_dot_dps));
-  y[1] = phi_dot_dps_m - phi_dot_dps;
-
-  phi_deg += K[0][0] * y[0] + K[0][1] * y[1];
-  phi_dot_dps += K[1][0] * y[0] + K[1][1] * y[1];
+  phi_deg += K_0 * y;
+  phi_dot_bias += K_1 * y;
+  phi_dot_dps = phi_dot_dps_m - phi_dot_bias;
+  P_00 -= K_0 * P_00;
+  P_01 -= K_0 * P_01;
+  P_10 -= K_1 * P_00;
+  P_11 -= K_1 * P_01;
+#endif
+#endif
 }
 
 int16_t runAngleController(void)
 {
-  return (int16_t)constrain((KP_ANGLE * phi_deg) + (KD_ANGLE * phi_dot_dps), -MAX_PWM, MAX_PWM);
+  static float phi_deg_last = 0.0f;
+  static float I = 0.0f;
+
+  I += phi_deg;
+  I = constrain(I, -300, 300);
+
+  const int16_t u = (int16_t)constrain((KP_ANGLE * phi_deg) + (KI_ANGLE * I * dt) + (KD_ANGLE * ((phi_deg - phi_deg_last) / dt)), -MAX_PWM, MAX_PWM);
+  phi_deg_last = phi_deg;
+  return u;
 }
 
 void rightEncoderIsr(void)
@@ -288,29 +285,4 @@ void initFailedloop(const String failure_msg) {
   while (1) {
     delay(10);
   }
-}
-
-void mul2x2(const float A[2][2], float B[2][2], float C[2][2])
-{
-  for (uint8_t i = 0; i < 2; i++)
-  {
-    for (uint8_t j = 0; j < 2; j++)
-    {
-      C[i][j] = 0;
-      for (uint8_t k = 0; k < 2; k++)
-      {
-        C[i][j] += A[i][k] * B[k][j];
-      }
-    }
-  }
-}
-
-void inv2x2(const float A[2][2], float B[2][2])
-{
-  const float det = (A[0][0] * A[1][1]) - (A[0][1] * A[1][0]);
-  const float det_inv = 1 / det;
-  B[0][0] = det_inv * A[1][1];
-  B[0][1] = det_inv * -A[0][1];
-  B[1][0] = det_inv * -A[1][0];
-  B[1][1] = det_inv * A[0][0];
 }
